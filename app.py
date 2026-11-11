@@ -5,6 +5,8 @@
 - 可调 top_n（送给 LLM 的文档数）
 - 可调召回候选数 k
 - 带上下文记忆的多轮对话
+- 流式输出回答
+- 按浏览器会话隔离对话和检索设置，支持导出当前对话
 - 展示检索来源和原文片段
 """
 
@@ -96,40 +98,26 @@ except Exception as e:
 # ============================================================
 # 根据侧边栏选择，动态切换检索器
 # ============================================================
-def get_retriever(strategy, top_n, recall_k):
-    """根据策略名返回检索函数"""
+def retrieve_documents(question, strategy, top_n, recall_k):
+    """为当前请求设置检索参数，避免修改缓存中的共享检索器。"""
     if strategy == "纯向量检索":
-        def fn(q):
-            return engine.vector_store.similarity_search(q, k=top_n)
-        return fn
+        return engine.vector_store.similarity_search(question, k=top_n)
 
     if strategy == "纯 BM25 检索":
-        def fn(q):
-            return engine.bm25_retriever.invoke(q)[:top_n]
-        return fn
+        bm25 = engine.bm25_retriever.model_copy(update={"k": top_n})
+        return bm25.invoke(question)
 
+    vector = engine.vector_retriever.model_copy(update={"search_kwargs": {"k": recall_k}})
+    bm25 = engine.bm25_retriever.model_copy(update={"k": recall_k})
+    ensemble = engine.ensemble_retriever.model_copy(update={"retrievers": [vector, bm25]})
     if strategy == "混合检索（向量+BM25）":
-        engine.vector_retriever.search_kwargs = {"k": recall_k}
-        engine.bm25_retriever.k = recall_k
-        def fn(q):
-            return engine.ensemble_retriever.invoke(q)[:top_n]
-        return fn
+        return ensemble.invoke(question)[:top_n]
 
-    if strategy == "混合检索 + 重排":
-        engine.vector_retriever.search_kwargs = {"k": recall_k}
-        engine.bm25_retriever.k = recall_k
-        engine.reranker.top_n = top_n
-        def fn(q):
-            return engine.retrieval_chain.invoke(q)
-        return fn
-
-    # 默认走完整检索链
-    def fn(q):
-        return engine.retrieval_chain.invoke(q)
-    return fn
-
-
-retrieve_fn = get_retriever(recall_strategy, top_n, recall_k)
+    reranker = engine.reranker.model_copy(update={"top_n": top_n})
+    chain = engine.retrieval_chain.model_copy(
+        update={"base_retriever": ensemble, "base_compressor": reranker}
+    )
+    return chain.invoke(question)
 
 
 # ============================================================
@@ -164,7 +152,7 @@ def build_context(docs):
 # ============================================================
 # 生成回答（带上下文记忆）
 # ============================================================
-def generate_with_memory(question, context, history):
+def stream_answer(question, context, history):
     """
     把最近几轮对话 + 当前检索上下文一起交给 LLM
     history: List[dict]，每个 dict 形如 {"role": "user"/"assistant", "content": "..."}
@@ -195,8 +183,26 @@ def generate_with_memory(question, context, history):
 
 回答：
 """
-    response = engine.llm.invoke(prompt)
-    return response.content
+    for chunk in engine.llm.stream(prompt):
+        if chunk.text:
+            yield chunk.text
+
+
+def render_streamed_answer(question, docs, history):
+    response = st.empty()
+    try:
+        with response.container():
+            answer = st.write_stream(stream_answer(question, build_context(docs), history))
+    except Exception:
+        response.empty()
+        st.error("回答生成中断，请重新发送问题。")
+        return None
+
+    if not answer.strip():
+        response.empty()
+        st.error("模型未返回回答，请重新发送问题。")
+        return None
+    return answer
 
 
 # ============================================================
@@ -215,15 +221,13 @@ question = st.chat_input("请输入你的问题...")
 
 if question:
     # 1. 显示用户消息
-    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     # 2. 检索
     with st.spinner("正在检索..."):
         try:
-            docs = retrieve_fn(question)
-            docs = (docs or [])[:top_n]
+            docs = retrieve_documents(question, recall_strategy, top_n, recall_k)
         except Exception as e:
             st.error(f"检索失败：{e}")
             docs = []
@@ -234,15 +238,9 @@ if question:
             answer = "没有找到相关文档"
             st.markdown(answer)
         else:
-            context = build_context(docs)
+            answer = render_streamed_answer(question, docs, st.session_state.messages)
 
-            with st.spinner("正在生成回答..."):
-                answer = generate_with_memory(
-                    question, context, st.session_state.messages[:-1]
-                )
-
-            st.markdown(answer)
-
+        if docs and answer is not None:
             # 4. 展示来源
             with st.expander("📎 查看检索到的原文片段"):
                 for i, doc in enumerate(docs, 1):
@@ -258,5 +256,26 @@ if question:
                     )
                     st.divider()
 
-    # 5. 记录助手消息
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+    # 5. 记录完整的一轮对话
+    if answer is not None:
+        st.session_state.messages.extend([
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ])
+
+
+messages = st.session_state.messages
+transcript = ["# 企业知识库问答记录"]
+for message in messages:
+    speaker = "用户" if message["role"] == "user" else "助手"
+    transcript.append(f"## {speaker}\n\n{message['content']}")
+
+st.sidebar.download_button(
+    "导出对话（Markdown）",
+    data=("\n\n".join(transcript) + "\n").encode("utf-8"),
+    file_name="企业知识库问答记录.md",
+    mime="text/markdown",
+    disabled=not messages,
+    on_click="ignore",
+    key="download_transcript",
+)
